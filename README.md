@@ -25,41 +25,32 @@ git clone https://github.com/louzt/dms-wallpaper-daemon.git ~/.config/DankMateri
 dms ipc plugins enable wallpaperDaemon
 ```
 
-### 2. Create the restore service (recommended)
+### 2. Install the restore service (recommended)
 
-For wallpaper restoration at boot, create `~/.config/systemd/user/waypaper-restore.service`:
+This restores wallpapers at boot, before DMS loads.
 
-```ini
-[Unit]
-Description=Restore Waypaper wallpapers
-PartOf=niri.service
-After=niri.service dms.service
-Requisite=niri.service
-
-[Service]
-Type=oneshot
-Environment=XDG_SESSION_TYPE=wayland
-Environment=WAYLAND_DISPLAY=wayland-1
-Environment=NIRI_SOCKET=/run/user/1001/niri.wayland-1.sock
-ExecStart=/path/to/waypaper-video-random --restore-or-random --restore-only
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=niri.service
-```
-
-**Important:** `linux-wallpaperengine` requires Wayland session environment variables. Without them, it will crash with:
-```
-Cannot read environment variable XDG_SESSION_TYPE, window server detection failed
-```
-
-Adjust `NIRI_SOCKET` path for your system (check `ls /run/user/1001/niri*.sock`).
-
-Then enable:
 ```bash
+# Copy the service file
+cp ~/.config/DankMaterialShell/plugins/wallpaperDaemon/systemd/waypaper-restore.service \
+   ~/.config/systemd/user/
+
+# Edit the service to match your setup:
+# - Set the correct NIRI_SOCKET path (check: ls /run/user/$(id -u)/niri*.sock)
+# - Set the correct path to waypaper-video-random
+
+# Reload and enable
 systemctl --user daemon-reload
 systemctl --user enable --now waypaper-restore.service
+```
+
+### 3. Verify
+
+```bash
+# Check service status
+systemctl --user status waypaper-restore.service
+
+# See restored wallpapers
+ps aux | grep -E 'mpvpaper|linux-wallpaperengine' | grep -v grep
 ```
 
 ## Configuration
@@ -86,10 +77,10 @@ This plugin is designed to work with [`waypaper-video-random`](https://github.co
 
 ## How it works
 
-1. On boot, `waypaper-restore.service` runs the restore script
-2. The script applies wallpapers via Waypaper (with correct env vars)
-3. The plugin syncs active wallpapers to DMS via `dms ipc wallpaper setFor`
-4. If cycling is enabled, a timer triggers `--random` at the configured interval
+1. On boot, `waypaper-restore.service` runs before DMS
+2. It restores wallpapers via waypaper with correct Wayland environment
+3. When DMS starts, the plugin syncs wallpaper state via IPC
+4. If cycling is enabled, the plugin triggers `--random` at the configured interval
 
 ## Troubleshooting
 
@@ -105,14 +96,20 @@ This plugin is designed to work with [`waypaper-video-random`](https://github.co
    journalctl --user -u waypaper-restore.service
    ```
 
-3. Verify environment variables are set in the service file:
+3. Find your NIRI socket:
    ```bash
-   grep -i environment ~/.config/systemd/user/waypaper-restore.service
+   ls /run/user/$(id -u)/niri*.sock
    ```
 
-4. Test manually:
+4. Update the `NIRI_SOCKET` in the service file, then:
    ```bash
-   waypaper --restore
+   systemctl --user daemon-reload
+   systemctl --user restart waypaper-restore.service
+   ```
+
+5. Test manually:
+   ```bash
+   XDG_SESSION_TYPE=wayland WAYLAND_DISPLAY=wayland-1 waypaper --restore
    ```
 
 ### linux-wallpaperengine crashes immediately
@@ -120,7 +117,7 @@ This plugin is designed to work with [`waypaper-video-random`](https://github.co
 This usually means missing Wayland environment variables. The restore service **must** have:
 - `XDG_SESSION_TYPE=wayland`
 - `WAYLAND_DISPLAY=wayland-1`
-- `NIRI_SOCKET=/run/user/1001/niri.wayland-1.sock` (adjust for your user)
+- `NIRI_SOCKET` pointing to your niri socket
 
 ### Cycling not working
 
@@ -131,6 +128,18 @@ This usually means missing Wayland environment variables. The restore service **
 ### DMS doesn't show wallpaper
 
 Make sure **Sync to DMS** is enabled in plugin settings.
+
+## File Structure
+
+```
+wallpaperDaemon/
+├── plugin.json                    # Plugin manifest
+├── WallpaperDaemon.qml           # Main daemon component
+├── WallpaperDaemonSettings.qml   # Settings UI
+├── systemd/
+│   └── waypaper-restore.service # Boot-time restore service (install manually)
+└── README.md
+```
 
 ## License
 
