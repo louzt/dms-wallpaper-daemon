@@ -18,24 +18,48 @@ A DankMaterialShell plugin that restores Waypaper wallpapers at startup and sync
 
 ## Installation
 
-### Option 1: Clone to plugins directory
+### 1. Install the plugin
 
 ```bash
 git clone https://github.com/louzt/dms-wallpaper-daemon.git ~/.config/DankMaterialShell/plugins/wallpaperDaemon
-```
-
-### Option 2: Manual
-
-Copy `plugin.json`, `WallpaperDaemon.qml`, and `WallpaperDaemonSettings.qml` to:
-
-```
-~/.config/DankMaterialShell/plugins/wallpaperDaemon/
-```
-
-## Enable the plugin
-
-```bash
 dms ipc plugins enable wallpaperDaemon
+```
+
+### 2. Create the restore service (recommended)
+
+For wallpaper restoration at boot, create `~/.config/systemd/user/waypaper-restore.service`:
+
+```ini
+[Unit]
+Description=Restore Waypaper wallpapers
+PartOf=niri.service
+After=niri.service dms.service
+Requisite=niri.service
+
+[Service]
+Type=oneshot
+Environment=XDG_SESSION_TYPE=wayland
+Environment=WAYLAND_DISPLAY=wayland-1
+Environment=NIRI_SOCKET=/run/user/1001/niri.wayland-1.sock
+ExecStart=/path/to/waypaper-video-random --restore-or-random --restore-only
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=niri.service
+```
+
+**Important:** `linux-wallpaperengine` requires Wayland session environment variables. Without them, it will crash with:
+```
+Cannot read environment variable XDG_SESSION_TYPE, window server detection failed
+```
+
+Adjust `NIRI_SOCKET` path for your system (check `ls /run/user/1001/niri*.sock`).
+
+Then enable:
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now waypaper-restore.service
 ```
 
 ## Configuration
@@ -62,8 +86,8 @@ This plugin is designed to work with [`waypaper-video-random`](https://github.co
 
 ## How it works
 
-1. On DMS startup, the plugin runs the restore script
-2. The script applies wallpapers via Waypaper
+1. On boot, `waypaper-restore.service` runs the restore script
+2. The script applies wallpapers via Waypaper (with correct env vars)
 3. The plugin syncs active wallpapers to DMS via `dms ipc wallpaper setFor`
 4. If cycling is enabled, a timer triggers `--random` at the configured interval
 
@@ -71,9 +95,32 @@ This plugin is designed to work with [`waypaper-video-random`](https://github.co
 
 ### Wallpapers show as grey at startup
 
-1. Make sure Waypaper is installed and working: `waypaper --restore`
-2. Check the restore script path in plugin settings
-3. Check DMS logs: `journalctl --user -u dms.service`
+1. Make sure the restore service is running:
+   ```bash
+   systemctl --user status waypaper-restore.service
+   ```
+
+2. Check the restore logs:
+   ```bash
+   journalctl --user -u waypaper-restore.service
+   ```
+
+3. Verify environment variables are set in the service file:
+   ```bash
+   grep -i environment ~/.config/systemd/user/waypaper-restore.service
+   ```
+
+4. Test manually:
+   ```bash
+   waypaper --restore
+   ```
+
+### linux-wallpaperengine crashes immediately
+
+This usually means missing Wayland environment variables. The restore service **must** have:
+- `XDG_SESSION_TYPE=wayland`
+- `WAYLAND_DISPLAY=wayland-1`
+- `NIRI_SOCKET=/run/user/1001/niri.wayland-1.sock` (adjust for your user)
 
 ### Cycling not working
 
