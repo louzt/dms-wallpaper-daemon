@@ -1,0 +1,954 @@
+#!/usr/bin/env python3
+"""Apply Wallpaper Engine wallpapers per niri output with compatibility guards."""
+
+from __future__ import annotations
+
+import argparse
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass
+from datetime import datetime
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import random
+import re
+import shutil
+import subprocess
+import sys
+import time
+from typing import Any
+
+
+VIDEO_EXTENSIONS = {".mp4", ".webm", ".mkv", ".avi", ".mov"}
+TEXT_SCAN_EXTENSIONS = {".html", ".htm", ".js", ".mjs", ".json"}
+DEFAULT_ROOTS = [
+    Path("~/.steam/root/steamapps/workshop/content/431960").expanduser(),
+    Path("~/.steam/steam/steamapps/common/wallpaper_engine/projects/defaultprojects").expanduser(),
+]
+WAYPAPER = Path("~/.local/bin/waypaper").expanduser()
+CONFIG_DIR = Path("~/.config/waypaper").expanduser()
+RULES_PATH = CONFIG_DIR / "video-smart-rules.json"
+STATE_DIR = Path("~/.local/state/waypaper").expanduser()
+LOCK_PATH = STATE_DIR / "waypaper-video-random.lock"
+LAST_RUN_PATH = STATE_DIR / "waypaper-video-random-last.json"
+PRIVATE_RESTORE_PATH = STATE_DIR / "waypaper-video-random-restore.private.json"
+BENCHMARK_PATH = STATE_DIR / "waypaper-video-random-benchmark.json"
+METADATA_CACHE_PATH = STATE_DIR / "waypaper-video-metadata-cache.private.json"
+DEFAULT_SUSPICIOUS_TITLE_REGEX = [
+    r"\bacam\b",
+    r"\bcamrip\b",
+    r"\bhdcam\b",
+    r"\bhdts\b",
+    r"\btelesync\b",
+    r"\btelecine\b",
+]
+
+COMPATIBILITY_PATTERNS = {
+    "web-audio-reactive": re.compile(r"AudioContext|AnalyserNode|getByteFrequencyData|registerAudioListener|wallpaperRegisterAudioListener|audio[-_ ]?react", re.I),
+    "web-wallpaper-engine-api": re.compile(r"wallpaperPropertyListener|applyUserProperties|window\.wallpaper|registerMediaPlaybackListener", re.I),
+    "web-pointer-reactive": re.compile(r"mousemove|pointermove|touchmove|deviceorientation|parallax|cursor", re.I),
+    "web-webgl": re.compile(r"\bTHREE\b|three(?:\.min)?\.js|WebGLRenderer|webgl", re.I),
+    "scene-audio-reactive": re.compile(r"audio|sound|pulse|bass|frequency|spectrum", re.I),
+}
+
+METADATA_CACHE: dict[str, Any] = {}
+METADATA_CACHE_DIRTY = False
+METADATA_CACHE_SCHEMA = 3
+
+
+@dataclass(frozen=True)
+class OutputInfo:
+    name: str
+    x: int
+    y: int
+    width: int
+    height: int
+    transform: str
+
+    @property
+    def orientation(self) -> str:
+        if self.height > self.width * 1.12:
+            return "vertical"
+        if self.width > self.height * 1.12:
+            return "horizontal"
+        return "square"
+
+
+@dataclass(frozen=True)
+class Candidate:
+    project_dir: Path
+    wallpaper_path: Path
+    title: str
+    wallpaper_type: str
+    width: int | None
+    height: int | None
+    duration: float | None
+    tags: tuple[str, ...]
+
+    @property
+    def token(self) -> str:
+        return project_token(self.project_dir)
+
+    @property
+    def entry_ext(self) -> str:
+        return self.wallpaper_path.suffix.casefold() or "none"
+
+    @property
+    def orientation(self) -> str:
+        if self.width is None or self.height is None:
+            return "unknown"
+        if self.height > self.width * 1.12:
+            return "vertical"
+        if self.width > self.height * 1.12:
+            return "horizontal"
+        return "square"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Apply Wallpaper Engine wallpapers with per-output isolation.")
+    parser.add_argument("--root", action="append", type=Path, help="Wallpaper Engine library root to scan.")
+    parser.add_argument("--monitor", action="append", help="Output to update. Defaults to detected niri outputs.")
+    parser.add_argument("--mode", choices=("video", "smart", "all"), default="video", help="Candidate policy: video only, video+scene, or every supported type.")
+    parser.add_argument("--same", action="store_true", help="Use the same wallpaper on all outputs, still applied per output.")
+    parser.add_argument("--allow-all", action="store_true", help="Allow the global All target. Disabled by default for safety.")
+    parser.add_argument("--allow-duplicates", action="store_true", help="Allow the same project on more than one output in one random run.")
+    parser.add_argument("--include-web", action="store_true", help="Allow web wallpapers even though they often depend on unsupported runtime APIs.")
+    parser.add_argument("--allow-audio-reactive", action="store_true", help="Allow audio-reactive web/scene wallpapers.")
+    parser.add_argument("--exclude-project", action="append", default=[], help="Exclude a sanitized project token such as we:abc123.")
+    parser.add_argument("--exclude-title", action="append", default=[], help="Exclude titles matching this regex. Stored only locally when used in rules.")
+    parser.add_argument("--restore", action="store_true", help="Restore the last private per-output wallpaper state for connected outputs.")
+    parser.add_argument("--restore-or-random", action="store_true", help="Restore if possible, otherwise run a random cycle.")
+    parser.add_argument("--restore-only", action="store_true", help="During restore, skip connected outputs that do not have saved state.")
+    parser.add_argument("--list", action="store_true", help="List candidates with compatibility metadata and exit.")
+    parser.add_argument("--benchmark", action="store_true", help="Measure scan/filter/selection timing and write benchmark JSON.")
+    parser.add_argument("--dry-run", action="store_true", help="Print sanitized commands without applying wallpapers.")
+    parser.add_argument("--verbose", action="store_true", help="Print sanitized child output even when commands succeed.")
+    parser.add_argument("--max-retries", type=int, default=2, help="Retry failed random selections per output unless the output has a fixed single-item playlist.")
+    return parser.parse_args()
+
+
+@contextmanager
+def single_run_lock():
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with LOCK_PATH.open("w", encoding="utf-8") as lock_file:
+        try:
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("event=skip reason=already_running", file=sys.stderr)
+            raise SystemExit(75)
+        yield
+
+
+def project_token(project_dir: Path) -> str:
+    digest = hashlib.sha256(str(project_dir).encode("utf-8", errors="replace")).hexdigest()[:12]
+    return f"we:{digest}"
+
+
+def sanitize_text(value: str) -> str:
+    home = str(Path.home())
+    text = value.replace(home, "~")
+    replacements = [
+        ("~/.steam/root/steamapps/workshop/content/431960", "[workshop]"),
+        ("~/.steam/steam/steamapps/common/wallpaper_engine", "[wallpaper-engine]"),
+        ("~/.steam/root/steamapps/common/wallpaper_engine", "[wallpaper-engine]"),
+        ("~/.cache/waypaper", "[waypaper-cache]"),
+    ]
+    for old, new in replacements:
+        text = text.replace(old, new)
+    return text
+
+
+def notify(summary: str, body: str) -> None:
+    try:
+        if shutil.which("dms"):
+            subprocess.Popen(["dms", "notify", summary, body, "--app", "Waypaper"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        elif shutil.which("notify-send"):
+            subprocess.Popen(["notify-send", summary, body], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+
+
+def classify_waypaper_log_failure(log_text: str) -> str:
+    shared_lib = re.search(r"error while loading shared libraries: ([^:\s]+)", log_text)
+    if shared_lib:
+        return f"missing shared library {shared_lib.group(1)}"
+    checks = [
+        ("Project type missing", "missing project type or unresolved preset dependency"),
+        ("[json.exception.parse_error", "renderer JSON parse failure"),
+        ("Invalid vector format", "renderer rejected a scene vector value"),
+        ("Property must have a value", "renderer rejected a property without value"),
+        ("ReferenceError: engine is not defined", "scene expects unsupported Wallpaper Engine runtime globals"),
+        ("Text objects are not supported yet", "scene contains unsupported text objects"),
+        ("Unexpected type for property", "project uses an unsupported property type"),
+    ]
+    for needle, hint in checks:
+        if needle in log_text:
+            return hint
+    return "linux-wallpaperengine exited during Waypaper launch"
+
+
+def detect_waypaper_launch_failure(child_output: str, output_name: str) -> tuple[int, str, Path] | None:
+    log_paths = [Path(match) for match in re.findall(r"linux-wallpaperengine log file:\s*(\S+)", child_output)]
+    log_paths.extend(Path(match) for match in re.findall(r"(/\S*/\.cache/waypaper/linux-wallpaperengine/\S+\.log)", child_output))
+    seen: set[Path] = set()
+    for log_path in reversed(log_paths):
+        if log_path in seen or output_name not in log_path.name or not log_path.exists():
+            continue
+        seen.add(log_path)
+        try:
+            log_text = log_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if "suppressing launch-failed notification" in log_text:
+            return None
+        match = re.search(r"Process status after initial check: exited with code (-?\d+)", log_text)
+        if match is None:
+            continue
+        return int(match.group(1)), classify_waypaper_log_failure(log_text), log_path
+    return None
+
+
+def read_project_json(project_dir: Path) -> dict[str, Any]:
+    try:
+        data = json.loads((project_dir / "project.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def metadata_title(project_dir: Path) -> str:
+    data = read_project_json(project_dir)
+    title = data.get("title") or data.get("name")
+    if isinstance(title, str) and title.strip():
+        return title.strip()
+    return project_dir.name
+
+
+def wallpaper_type(project_dir: Path) -> str:
+    kind = read_project_json(project_dir).get("type")
+    return str(kind).strip().lower() if kind else "unknown"
+
+
+def entry_path(project_dir: Path) -> Path:
+    entry_name = read_project_json(project_dir).get("file")
+    if isinstance(entry_name, str) and entry_name.strip():
+        candidate = project_dir / entry_name
+        if candidate.exists():
+            return candidate
+    return project_dir
+
+
+def read_text(path: Path, max_bytes: int = 512_000) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="ignore")[:max_bytes]
+    except OSError:
+        return ""
+
+
+def compatibility_tags(project_dir: Path, kind: str) -> tuple[str, ...]:
+    tags: list[str] = []
+    if kind == "video":
+        tags.append("native-video")
+    elif kind == "web":
+        tags.append("web-runtime")
+    elif kind == "scene":
+        tags.append("scene-runtime")
+
+    text_parts: list[str] = []
+    for candidate in sorted(project_dir.rglob("*"))[:1600]:
+        if candidate.is_file() and candidate.suffix.casefold() in TEXT_SCAN_EXTENSIONS:
+            text_parts.append(read_text(candidate))
+        if len(text_parts) >= 32:
+            break
+    text = "\n".join(text_parts)
+    for tag, pattern in COMPATIBILITY_PATTERNS.items():
+        if pattern.search(text):
+            if tag.startswith("web-") and kind != "web":
+                continue
+            if tag.startswith("scene-") and kind != "scene":
+                continue
+            tags.append(tag)
+    return tuple(dict.fromkeys(tags))
+
+
+def probe_video(path: Path) -> tuple[int | None, int | None, float | None]:
+    if path.suffix.casefold() not in VIDEO_EXTENSIONS or shutil.which("ffprobe") is None:
+        return None, None, None
+    global METADATA_CACHE_DIRTY
+    try:
+        stat = path.stat()
+        cache_key = str(path)
+        cached = METADATA_CACHE.get(cache_key)
+        if isinstance(cached, dict) and cached.get("schema") == METADATA_CACHE_SCHEMA and cached.get("mtime_ns") == stat.st_mtime_ns and cached.get("size") == stat.st_size:
+            return cached.get("width"), cached.get("height"), cached.get("duration")
+    except OSError:
+        return None, None, None
+    command = [
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=width,height,duration:stream_tags=rotate:stream_side_data=rotation", "-of", "json", str(path),
+    ]
+    try:
+        result = subprocess.run(command, text=True, capture_output=True, timeout=2, check=False)
+        data = json.loads(result.stdout or "{}")
+        stream = (data.get("streams") or [{}])[0]
+        width = int(stream["width"]) if stream.get("width") else None
+        height = int(stream["height"]) if stream.get("height") else None
+        duration = float(stream["duration"]) if stream.get("duration") else None
+        rotate = 0
+        tags = stream.get("tags") if isinstance(stream.get("tags"), dict) else {}
+        if tags.get("rotate"):
+            rotate = abs(int(float(tags["rotate"]))) % 180
+        for side_data in stream.get("side_data_list", []) if isinstance(stream.get("side_data_list"), list) else []:
+            if isinstance(side_data, dict) and side_data.get("rotation"):
+                rotate = abs(int(float(side_data["rotation"]))) % 180
+        if rotate == 90 and width and height:
+            width, height = height, width
+        METADATA_CACHE[cache_key] = {
+            "schema": METADATA_CACHE_SCHEMA,
+            "mtime_ns": stat.st_mtime_ns,
+            "size": stat.st_size,
+            "width": width,
+            "height": height,
+            "duration": duration,
+        }
+        METADATA_CACHE_DIRTY = True
+        return width, height, duration
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError, ValueError, IndexError):
+        return None, None, None
+
+
+def load_metadata_cache() -> None:
+    global METADATA_CACHE
+    try:
+        data = json.loads(METADATA_CACHE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        METADATA_CACHE = {}
+        return
+    METADATA_CACHE = data if isinstance(data, dict) else {}
+
+
+def write_metadata_cache() -> None:
+    if not METADATA_CACHE_DIRTY:
+        return
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    METADATA_CACHE_PATH.write_text(json.dumps(METADATA_CACHE, indent=2, sort_keys=True), encoding="utf-8")
+    METADATA_CACHE_PATH.chmod(0o600)
+
+
+def candidate_for_project(project_dir: Path) -> Candidate | None:
+    kind = wallpaper_type(project_dir)
+    entry = entry_path(project_dir)
+    if kind not in {"scene", "video", "web"} or not entry.is_file():
+        return None
+    width, height, duration = probe_video(entry)
+    return Candidate(
+        project_dir=project_dir,
+        wallpaper_path=entry,
+        title=metadata_title(project_dir),
+        wallpaper_type=kind,
+        width=width,
+        height=height,
+        duration=duration,
+        tags=compatibility_tags(project_dir, kind),
+    )
+
+
+def collect_candidates(roots: list[Path]) -> list[Candidate]:
+    candidates: dict[Path, Candidate] = {}
+    for root in roots:
+        root = root.expanduser()
+        if not root.exists():
+            continue
+        for project_json in root.rglob("project.json"):
+            candidate = candidate_for_project(project_json.parent)
+            if candidate is not None:
+                candidates[candidate.project_dir] = candidate
+    return sorted(candidates.values(), key=lambda item: item.title.casefold())
+
+
+def niri_outputs() -> list[OutputInfo]:
+    if not os.environ.get("NIRI_SOCKET") and shutil.which("niri"):
+        runtime_dir = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
+        sockets = list(runtime_dir.glob("niri.*sock"))
+        if sockets:
+            def socket_mtime(socket_path: Path) -> float:
+                try:
+                    return socket_path.stat().st_mtime
+                except OSError:
+                    return 0.0
+
+            os.environ["NIRI_SOCKET"] = str(max(sockets, key=socket_mtime))
+    try:
+        result = subprocess.run(["niri", "msg", "-j", "outputs"], check=True, capture_output=True, text=True)
+        outputs = json.loads(result.stdout)
+    except (subprocess.CalledProcessError, FileNotFoundError, json.JSONDecodeError):
+        return []
+    rows: list[OutputInfo] = []
+    if isinstance(outputs, dict):
+        iterator = outputs.items()
+    elif isinstance(outputs, list):
+        iterator = ((str(item.get("name") or ""), item) for item in outputs if isinstance(item, dict))
+    else:
+        iterator = []
+    for name, data in iterator:
+        if not name:
+            continue
+        logical = data.get("logical", {}) if isinstance(data, dict) else {}
+        rows.append(OutputInfo(
+            name=name,
+            x=int(logical.get("x", 0) or 0),
+            y=int(logical.get("y", 0) or 0),
+            width=int(logical.get("width", 0) or 0),
+            height=int(logical.get("height", 0) or 0),
+            transform=str(logical.get("transform", "Normal")),
+        ))
+    return sorted(rows, key=lambda item: (item.x, item.y, item.name))
+
+
+def default_rules(outputs: list[OutputInfo]) -> dict[str, Any]:
+    return {
+        "exclude_projects": [],
+        "exclude_title_regex": [],
+        "exclude_path_regex": [],
+        "exclude_tags": ["web-audio-reactive", "web-wallpaper-engine-api"],
+        "reject_suspicious_titles": True,
+        "suspicious_title_regex": list(DEFAULT_SUSPICIOUS_TITLE_REGEX),
+        "rotation_mode": "sync-all",
+        "cycle_interval_seconds": 1800,
+        "playlist": [],
+        "per_output": {output.name: {"prefer_orientation": "auto", "playlist": [], "exclude_projects": []} for output in outputs},
+        "notes": "Local file. Use sanitized project tokens from --list/--benchmark in exclude_projects or playlists.",
+    }
+
+
+def load_rules(outputs: list[OutputInfo]) -> dict[str, Any]:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    if not RULES_PATH.exists():
+        rules = default_rules(outputs)
+        RULES_PATH.write_text(json.dumps(rules, indent=2, sort_keys=True), encoding="utf-8")
+        RULES_PATH.chmod(0o600)
+        return rules
+    try:
+        data = json.loads(RULES_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return default_rules(outputs)
+    if not isinstance(data, dict):
+        return default_rules(outputs)
+    changed = False
+    if not isinstance(data.get("playlist"), list):
+        data["playlist"] = []
+        changed = True
+    if not isinstance(data.get("exclude_path_regex"), list):
+        data["exclude_path_regex"] = []
+        changed = True
+    if not isinstance(data.get("suspicious_title_regex"), list):
+        data["suspicious_title_regex"] = list(DEFAULT_SUSPICIOUS_TITLE_REGEX)
+        changed = True
+    if not isinstance(data.get("reject_suspicious_titles"), bool):
+        data["reject_suspicious_titles"] = bool(data.get("reject_suspicious_titles", True))
+        changed = True
+    rotation_mode = str(data.get("rotation_mode", "sync-all")).strip().lower()
+    if rotation_mode not in {"sync-all", "round-robin"}:
+        data["rotation_mode"] = "sync-all"
+        changed = True
+    else:
+        data["rotation_mode"] = rotation_mode
+    try:
+        cycle_interval_seconds = int(data.get("cycle_interval_seconds", 1800))
+        if cycle_interval_seconds <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        cycle_interval_seconds = 1800
+        changed = True
+    data["cycle_interval_seconds"] = cycle_interval_seconds
+    per_output = data.setdefault("per_output", {})
+    if isinstance(per_output, dict):
+        for output in outputs:
+            if output.name not in per_output:
+                per_output[output.name] = {"prefer_orientation": "auto", "playlist": [], "exclude_projects": []}
+                changed = True
+    if changed:
+        RULES_PATH.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+        RULES_PATH.chmod(0o600)
+    return data
+
+
+def compile_patterns(patterns: list[str], scope: str) -> list[re.Pattern[str]]:
+    compiled: list[re.Pattern[str]] = []
+    for pattern in patterns:
+        try:
+            compiled.append(re.compile(pattern, re.I))
+        except re.error:
+            print(f"event=invalid_regex scope={scope} pattern={sanitize_text(pattern)}", file=sys.stderr)
+    return compiled
+
+
+def filtered_candidates(candidates: list[Candidate], output: OutputInfo | None, rules: dict[str, Any], args: argparse.Namespace) -> list[Candidate]:
+    exclude_projects = set(rules.get("exclude_projects", [])) | set(args.exclude_project or [])
+    exclude_tags = set(rules.get("exclude_tags", []))
+    title_patterns = compile_patterns(list(rules.get("exclude_title_regex", [])) + list(args.exclude_title or []), "exclude_title_regex")
+    path_patterns = compile_patterns(list(rules.get("exclude_path_regex", [])), "exclude_path_regex")
+    global_playlist = set(rules.get("playlist", []) if isinstance(rules.get("playlist"), list) else [])
+    suspicious_patterns = compile_patterns(
+        list(rules.get("suspicious_title_regex", [])) if rules.get("reject_suspicious_titles", True) else [],
+        "suspicious_title_regex",
+    )
+    if output is not None:
+        per_output = rules.get("per_output", {}).get(output.name, {}) if isinstance(rules.get("per_output"), dict) else {}
+        exclude_projects |= set(per_output.get("exclude_projects", []))
+        playlist = set(per_output.get("playlist", []))
+    else:
+        playlist = set()
+    allowed_types = {"video"} if args.mode == "video" else {"video", "scene"} if args.mode == "smart" else {"video", "scene", "web"}
+    if args.include_web:
+        allowed_types.add("web")
+    out: list[Candidate] = []
+    for candidate in candidates:
+        if global_playlist and candidate.token not in global_playlist:
+            continue
+        if playlist and candidate.token not in playlist:
+            continue
+        if candidate.wallpaper_type not in allowed_types:
+            continue
+        if candidate.wallpaper_type == "web" and not args.include_web and args.mode != "all":
+            continue
+        if candidate.token in exclude_projects:
+            continue
+        if any(pattern.search(candidate.title) for pattern in title_patterns):
+            continue
+        path_text = f"{candidate.project_dir}\n{candidate.wallpaper_path}"
+        if any(pattern.search(path_text) for pattern in path_patterns):
+            continue
+        if any(pattern.search(candidate.title) or pattern.search(path_text) for pattern in suspicious_patterns):
+            continue
+        if not args.allow_audio_reactive and any(tag.endswith("audio-reactive") for tag in candidate.tags):
+            continue
+        if exclude_tags.intersection(candidate.tags):
+            continue
+        out.append(candidate)
+    return out
+
+
+def orientation_score(output: OutputInfo, candidate: Candidate, rules: dict[str, Any]) -> int:
+    per_output = rules.get("per_output", {}).get(output.name, {}) if isinstance(rules.get("per_output"), dict) else {}
+    preferred = str(per_output.get("prefer_orientation", "auto"))
+    target = output.orientation if preferred == "auto" else preferred
+    if candidate.orientation == target:
+        return 100
+    if candidate.orientation == "square":
+        return 45
+    if candidate.orientation == "unknown":
+        return 20
+    return -20
+
+
+def choose_for_outputs(outputs: list[OutputInfo], candidates: list[Candidate], rules: dict[str, Any], args: argparse.Namespace) -> list[tuple[OutputInfo, Candidate]]:
+    if args.same:
+        shared_pool = filtered_candidates(candidates, None, rules, args)
+        if not shared_pool:
+            raise SystemExit("No candidates available for --same.")
+        selected = random.choice(shared_pool)
+        return [(output, selected) for output in outputs]
+    restore_rows = load_private_restore_rows()
+    used: set[str] = set()
+    selections: list[tuple[OutputInfo, Candidate]] = []
+    for output in outputs:
+        pool = filtered_candidates(candidates, output, rules, args)
+        if not args.allow_duplicates:
+            pool = [candidate for candidate in pool if candidate.token not in used] or pool
+        if not pool:
+            fallback_row = restore_rows.get(output.name)
+            fallback_candidate = restore_candidate(fallback_row) if isinstance(fallback_row, dict) else None
+            if fallback_candidate is not None:
+                print(f"event=keep_current monitor={output.name} project={fallback_candidate.token} reason=no_candidates")
+                used.add(fallback_candidate.token)
+                selections.append((output, fallback_candidate))
+                continue
+            raise SystemExit(f"No candidates available for output: {output.name}")
+        best_score = max(orientation_score(output, item, rules) for item in pool)
+        best_pool = [item for item in pool if orientation_score(output, item, rules) == best_score]
+        selected = random.choice(best_pool)
+        used.add(selected.token)
+        selections.append((output, selected))
+    return selections
+
+
+def _is_mpvpaper_alive_for_output(output_name: str) -> bool:
+    """Check if mpvpaper is actually running for this output."""
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", f"mpvpaper.*{output_name}"],
+            capture_output=True, check=False,
+        )
+        return result.returncode == 0
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+
+
+def _get_mpvpaper_wallpaper_path(output_name: str) -> str | None:
+    """Get the actual wallpaper path that mpvpaper is showing for this output."""
+    try:
+        result = subprocess.run(
+            ["pgrep", "-a", "-f", f"mpvpaper.*{output_name}"],
+            capture_output=True, check=False, text=True,
+        )
+        if result.returncode != 0:
+            return None
+        # mpvpaper command line has the path as last argument
+        # Format: mpvpaper ... output_name /path/to/video.mp4
+        parts = result.stdout.strip().split()
+        if len(parts) >= 2:
+            return parts[-1]
+        return None
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+
+
+def apply_wallpaper(candidate: Candidate, output_name: str, dry_run: bool, verbose: bool) -> dict[str, Any]:
+    current_row = load_private_restore_rows().get(output_name, {})
+    current_token = str(current_row.get("project") or "").strip() if isinstance(current_row, dict) else ""
+    if current_token == candidate.token and int(current_row.get("returncode", 0)) == 0:
+        # Check if mpvpaper is actually running AND showing the correct wallpaper
+        if _is_mpvpaper_alive_for_output(output_name):
+            running_path = _get_mpvpaper_wallpaper_path(output_name)
+            if running_path and Path(running_path).resolve() == candidate.wallpaper_path.resolve():
+                print(f"event=skip monitor={output_name} project={candidate.token} reason=already_active")
+                return public_result(output_name, candidate, 0)
+            print(f"event=resume monitor={output_name} project={candidate.token} reason=mpvpaper_wrong_wallpaper")
+        else:
+            print(f"event=resume monitor={output_name} project={candidate.token} reason=was_active_but_dead")
+
+    command = [
+        str(WAYPAPER), "--backend", "linux-wallpaperengine", "--fill", "fill",
+        "--monitor", output_name, "--wallpaper", str(candidate.wallpaper_path), "--no-post-command",
+    ]
+    risky_tags = [tag for tag in candidate.tags if tag != "native-video"]
+    if risky_tags:
+        tag_text = ",".join(risky_tags)
+        print(f"event=compat_warning monitor={output_name} project={candidate.token} tags={tag_text}")
+        notify("Wallpaper compatibility", f"{output_name}: {candidate.token} {tag_text}")
+    print(f"event=apply monitor={output_name} project={candidate.token} type={candidate.wallpaper_type} orientation={candidate.orientation} entry_ext={candidate.entry_ext}")
+    if dry_run:
+        print(f"event=dry_run monitor={output_name} command='waypaper --backend linux-wallpaperengine --fill fill --monitor {output_name} --wallpaper {candidate.token}{candidate.entry_ext} --no-post-command'")
+        return public_result(output_name, candidate, 0)
+    result = subprocess.run(command, check=False, capture_output=True, text=True)
+    raw_child_output = (result.stdout or "") + (result.stderr or "")
+    effective_returncode = result.returncode
+    launch_failure = detect_waypaper_launch_failure(raw_child_output, output_name)
+    if launch_failure is not None:
+        effective_returncode, reason, log_path = launch_failure
+        print(f"event=waypaper_launch_failed monitor={output_name} project={candidate.token} code={effective_returncode} reason={reason} log={sanitize_text(str(log_path))}")
+        notify("Wallpaper launch failed", f"{output_name}: {candidate.token} {reason}")
+    child_output = sanitize_text(raw_child_output)
+    if effective_returncode != 0 or verbose:
+        tail = "\n".join(child_output.splitlines()[-40:])
+        if tail:
+            print(tail)
+    print(f"event=done monitor={output_name} project={candidate.token} returncode={effective_returncode}")
+    # Sync to DMS if successful
+    if effective_returncode == 0 and not dry_run:
+        _update_dms_wallpaper(output_name, str(candidate.wallpaper_path))
+    return public_result(output_name, candidate, effective_returncode)
+
+
+def _update_dms_wallpaper(output_name: str, wallpaper_path: str) -> None:
+    """Update DMS session data via IPC."""
+    try:
+        subprocess.run(
+            ["dms", "ipc", "wallpaper", "setFor", output_name, wallpaper_path],
+            capture_output=True, check=False, text=True, timeout=5,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass  # DMS not available or timeout
+
+
+def public_result(output_name: str, candidate: Candidate, returncode: int) -> dict[str, Any]:
+    return {
+        "monitor": output_name,
+        "project": candidate.token,
+        "returncode": returncode,
+        "type": candidate.wallpaper_type,
+        "orientation": candidate.orientation,
+        "entry_ext": candidate.entry_ext,
+        "tags": list(candidate.tags),
+    }
+
+
+def private_result(output_name: str, candidate: Candidate, returncode: int) -> dict[str, Any]:
+    data = public_result(output_name, candidate, returncode)
+    data.update({
+        "project_dir": str(candidate.project_dir),
+        "wallpaper_path": str(candidate.wallpaper_path),
+        "width": candidate.width,
+        "height": candidate.height,
+        "duration": candidate.duration,
+    })
+    return data
+
+
+def load_private_restore_rows() -> dict[str, dict[str, Any]]:
+    try:
+        payload = json.loads(PRIVATE_RESTORE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    rows = payload.get("results", []) if isinstance(payload, dict) else []
+    out: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        monitor = str(row.get("monitor", "")).strip()
+        if monitor:
+            out[monitor] = row
+    return out
+
+
+def write_states(public_results: list[dict[str, Any]], private_results: list[dict[str, Any]]) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().isoformat(timespec="seconds")
+    public_payload = {"created_at": timestamp, "results": public_results}
+    merged_private = load_private_restore_rows()
+    for row in private_results:
+        monitor = str(row.get("monitor", "")).strip()
+        if not monitor:
+            continue
+        if int(row.get("returncode", 1)) == 0:
+            merged_private[monitor] = row
+    private_payload = {
+        "created_at": timestamp,
+        "results": [merged_private[name] for name in sorted(merged_private)],
+    }
+    LAST_RUN_PATH.write_text(json.dumps(public_payload, indent=2, sort_keys=True), encoding="utf-8")
+    PRIVATE_RESTORE_PATH.write_text(json.dumps(private_payload, indent=2, sort_keys=True), encoding="utf-8")
+    LAST_RUN_PATH.chmod(0o600)
+    PRIVATE_RESTORE_PATH.chmod(0o600)
+
+
+def stop_static_wallpaper_daemons(dry_run: bool, rules: dict[str, Any]) -> None:
+    if rules.get("keep_static_underlay") is True:
+        print("event=keep_static_underlay action=skip_stop_static_daemons")
+        return
+    for name, command in (("swww", ["swww", "kill"]), ("awww", ["awww", "kill"])):
+        probe = subprocess.run(["pgrep", "-x", f"{name}-daemon"], text=True, capture_output=True, check=False)
+        if probe.returncode != 0:
+            continue
+        print(f"event=stop_static_daemon name={name}")
+        if not dry_run:
+            subprocess.run(command, text=True, capture_output=True, check=False)
+
+
+def restore_candidate(row: dict[str, Any]) -> Candidate | None:
+    project_dir = Path(str(row.get("project_dir", ""))).expanduser()
+    wallpaper_path = Path(str(row.get("wallpaper_path", ""))).expanduser()
+    if not project_dir.exists() or not wallpaper_path.exists():
+        return None
+    candidate = candidate_for_project(project_dir)
+    if candidate is None:
+        # Scene.pkg or other non-extractable project — use preview image directly
+        if wallpaper_path.suffix.lower() in {".jpg", ".jpeg", ".png", ".gif"}:
+            width, height, duration = probe_video(wallpaper_path)
+            return Candidate(
+                project_dir=project_dir,
+                wallpaper_path=wallpaper_path,
+                title=metadata_title(project_dir),
+                wallpaper_type="scene",
+                width=width,
+                height=height,
+                duration=duration,
+                tags=("preview-fallback",),
+            )
+        return None
+    if candidate.wallpaper_path != wallpaper_path:
+        width, height, duration = probe_video(wallpaper_path)
+        return Candidate(project_dir, wallpaper_path, metadata_title(project_dir), wallpaper_type(project_dir), width, height, duration, compatibility_tags(project_dir, wallpaper_type(project_dir)))
+    return candidate
+
+
+def restore(outputs: list[OutputInfo], candidates: list[Candidate], rules: dict[str, Any], args: argparse.Namespace) -> int:
+    if not PRIVATE_RESTORE_PATH.exists():
+        if args.restore_or_random:
+            return random_cycle(outputs, candidates, rules, args)
+        print("event=restore_missing_state")
+        return 66
+    try:
+        payload = json.loads(PRIVATE_RESTORE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return 66
+    rows = payload.get("results", []) if isinstance(payload, dict) else []
+    by_monitor = {str(row.get("monitor")): row for row in rows if isinstance(row, dict)}
+    active_names = {output.name for output in outputs}
+    disconnected = sorted(set(by_monitor) - active_names)
+    public_results: list[dict[str, Any]] = []
+    private_results: list[dict[str, Any]] = []
+    missing: list[str] = []
+    exit_code = 0
+    for output in outputs:
+        row = by_monitor.get(output.name)
+        candidate = restore_candidate(row) if row else None
+        if candidate is None:
+            if args.restore_only:
+                missing.append(output.name)
+                continue
+            selection = choose_for_outputs([output], candidates, rules, args)[0][1]
+            candidate = selection
+            print(f"event=restore_missing_monitor monitor={output.name} action=random_fill")
+        result = apply_wallpaper(candidate, output.name, args.dry_run, args.verbose)
+        public_results.append(result)
+        private_results.append(private_result(output.name, candidate, int(result["returncode"])))
+        exit_code = max(exit_code, int(result["returncode"]))
+    if disconnected:
+        print(f"event=restore_skip_disconnected monitors={','.join(disconnected)}")
+    if missing:
+        print(f"event=restore_skip_missing monitors={','.join(missing)}")
+    if not args.dry_run and public_results:
+        write_states(public_results, private_results)
+        body = f"restored={len(public_results)} disconnected={len(disconnected)} missing={len(missing)}"
+        notify("Wallpaper restore", body)
+    return exit_code
+
+
+def has_fixed_single_playlist(output: OutputInfo, rules: dict[str, Any]) -> bool:
+    global_playlist = rules.get("playlist", []) if isinstance(rules.get("playlist"), list) else []
+    per_output = rules.get("per_output", {}).get(output.name, {}) if isinstance(rules.get("per_output"), dict) else {}
+    output_playlist = per_output.get("playlist", []) if isinstance(per_output.get("playlist"), list) else []
+    if len(output_playlist) == 1:
+        return True
+    return len(global_playlist) == 1 and not output_playlist
+
+
+def choose_retry_candidate(
+    output: OutputInfo,
+    candidates: list[Candidate],
+    rules: dict[str, Any],
+    args: argparse.Namespace,
+    used: set[str],
+    tried: set[str],
+) -> Candidate | None:
+    pool = filtered_candidates(candidates, output, rules, args)
+    if not args.allow_duplicates:
+        pool = [candidate for candidate in pool if candidate.token not in used]
+    pool = [candidate for candidate in pool if candidate.token not in tried]
+    if not pool:
+        return None
+    best_score = max(orientation_score(output, item, rules) for item in pool)
+    best_pool = [item for item in pool if orientation_score(output, item, rules) == best_score]
+    return random.choice(best_pool)
+
+
+def random_cycle(outputs: list[OutputInfo], candidates: list[Candidate], rules: dict[str, Any], args: argparse.Namespace) -> int:
+    selections = choose_for_outputs(outputs, candidates, rules, args)
+    public_results: list[dict[str, Any]] = []
+    private_results: list[dict[str, Any]] = []
+    exit_code = 0
+    used: set[str] = set()
+    for output, candidate in selections:
+        fixed_single = has_fixed_single_playlist(output, rules)
+        tried: set[str] = set()
+        attempts = 0
+        while True:
+            tried.add(candidate.token)
+            result = apply_wallpaper(candidate, output.name, args.dry_run, args.verbose)
+            if int(result["returncode"]) == 0:
+                break
+            if fixed_single:
+                print(f"event=retry_skip monitor={output.name} project={candidate.token} reason=fixed_single_playlist")
+                break
+            if attempts >= max(0, args.max_retries):
+                print(f"event=retry_stop monitor={output.name} project={candidate.token} reason=max_retries")
+                break
+            replacement = choose_retry_candidate(output, candidates, rules, args, used, tried)
+            if replacement is None:
+                print(f"event=retry_stop monitor={output.name} project={candidate.token} reason=no_alternative")
+                break
+            attempts += 1
+            print(f"event=retry_failed_wallpaper monitor={output.name} failed={candidate.token} replacement={replacement.token} attempt={attempts}")
+            candidate = replacement
+        used.add(candidate.token)
+        public_results.append(result)
+        private_results.append(private_result(output.name, candidate, int(result["returncode"])))
+        exit_code = max(exit_code, int(result["returncode"]))
+    if not args.dry_run:
+        write_states(public_results, private_results)
+    return exit_code
+
+
+def benchmark(outputs: list[OutputInfo], candidates: list[Candidate], rules: dict[str, Any], args: argparse.Namespace, timings: dict[str, float]) -> int:
+    filtered_by_output = {output.name: [candidate.token for candidate in filtered_candidates(candidates, output, rules, args)] for output in outputs}
+    counts: dict[str, int] = {}
+    orientations: dict[str, int] = {}
+    tags: dict[str, int] = {}
+    for candidate in candidates:
+        counts[candidate.wallpaper_type] = counts.get(candidate.wallpaper_type, 0) + 1
+        orientations[candidate.orientation] = orientations.get(candidate.orientation, 0) + 1
+        for tag in candidate.tags:
+            tags[tag] = tags.get(tag, 0) + 1
+    payload = {
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "outputs": [asdict(output) | {"orientation": output.orientation} for output in outputs],
+        "candidate_counts": counts,
+        "candidate_orientations": orientations,
+        "compatibility_tags": tags,
+        "filtered_counts_by_output": {name: len(tokens) for name, tokens in filtered_by_output.items()},
+        "timings_ms": {key: round(value * 1000, 2) for key, value in timings.items()},
+    }
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    BENCHMARK_PATH.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    BENCHMARK_PATH.chmod(0o600)
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    return 0
+
+
+def list_candidates(candidates: list[Candidate]) -> int:
+    for candidate in candidates:
+        print("\t".join([
+            candidate.token,
+            candidate.wallpaper_type,
+            candidate.orientation,
+            candidate.entry_ext,
+            ",".join(candidate.tags),
+        ]))
+    return 0
+
+
+def main() -> int:
+    started = time.perf_counter()
+    args = parse_args()
+    roots = [root.expanduser() for root in args.root] if args.root else DEFAULT_ROOTS
+    outputs = niri_outputs()
+    if args.monitor:
+        known = {output.name: output for output in outputs}
+        outputs = [known.get(name, OutputInfo(name, 0, 0, 0, 0, "Unknown")) for name in args.monitor]
+    outputs = [output for output in outputs if output.name]
+    if any(output.name == "All" for output in outputs) and not args.allow_all:
+        print("Refusing monitor=All without --allow-all to preserve per-output isolation.", file=sys.stderr)
+        return 2
+    if not outputs:
+        print("No niri outputs detected; refusing to fall back to All without --allow-all.", file=sys.stderr)
+        return 2
+    output_done = time.perf_counter()
+    rules = load_rules(outputs)
+    rules_done = time.perf_counter()
+    load_metadata_cache()
+    candidates = collect_candidates(roots)
+    write_metadata_cache()
+    scan_done = time.perf_counter()
+    timings = {"outputs": output_done - started, "rules": rules_done - output_done, "scan": scan_done - rules_done}
+
+    if args.list:
+        return list_candidates(candidates)
+    if args.benchmark:
+        return benchmark(outputs, candidates, rules, args, timings)
+    if not candidates:
+        print("No Wallpaper Engine candidates found.", file=sys.stderr)
+        return 1
+
+    with single_run_lock():
+        stop_static_wallpaper_daemons(args.dry_run, rules)
+        if args.restore or args.restore_or_random:
+            return restore(outputs, candidates, rules, args)
+        return random_cycle(outputs, candidates, rules, args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

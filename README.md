@@ -1,6 +1,6 @@
 # DMS Wallpaper Daemon
 
-A DankMaterialShell plugin that restores Waypaper wallpapers at startup and syncs with DMS session.
+A DankMaterialShell plugin that restores Waypaper wallpapers at startup and syncs with DMS session. Includes `waypaper-video-random` for intelligent restore with wallpaper engine compatibility.
 
 ## Features
 
@@ -8,13 +8,13 @@ A DankMaterialShell plugin that restores Waypaper wallpapers at startup and sync
 - **Sync to DMS** via IPC so other components know the active wallpaper
 - **Optional wallpaper cycling** with configurable interval
 - **Fallback wallpaper** when Waypaper fails
+- **Smart restore** — verifies mpvpaper is showing the correct wallpaper before skipping
 - **Works with any Waypaper backend** (linux-wallpaperengine, mpvpaper, swww, etc.)
 
 ## Requirements
 
 - [DankMaterialShell (DMS)](https://github.com/SomeSomeone/DankMaterialShell)
 - [Waypaper](https://github.com/anufrievroman/waypaper)
-- `waypaper-video-random` script (optional, for advanced restore/random features)
 
 ## Installation
 
@@ -34,11 +34,7 @@ This restores wallpapers at boot, before DMS loads.
 cp ~/.config/DankMaterialShell/plugins/wallpaperDaemon/systemd/waypaper-restore.service \
    ~/.config/systemd/user/
 
-# Edit the service to match your setup:
-# - Set the correct NIRI_SOCKET path (check: ls /run/user/$(id -u)/niri*.sock)
-# - Set the correct path to waypaper-video-random
-
-# Reload and enable
+# Enable and start
 systemctl --user daemon-reload
 systemctl --user enable --now waypaper-restore.service
 ```
@@ -64,23 +60,24 @@ Access settings via **DMS Settings → Plugins → Wallpaper Daemon**:
 | Enable cycling | `false` | Periodically change wallpapers |
 | Cycle interval | `30 min` | How often to cycle wallpapers |
 | Fallback wallpaper | *(empty)* | Path to image shown when Waypaper fails |
-| Restore script | *(empty)* | Path to `waypaper-video-random` script |
-
-## Waypaper Video Random
-
-This plugin is designed to work with [`waypaper-video-random`](https://github.com/louzt/waypaper-video-random), a script that:
-
-- Restores the last wallpaper per monitor
-- Falls back to random wallpaper if no restore state exists
-- Filters Wallpaper Engine projects by compatibility tags
-- Supports per-output playlists
 
 ## How it works
 
 1. On boot, `waypaper-restore.service` runs before DMS
-2. It restores wallpapers via waypaper with correct Wayland environment
-3. When DMS starts, the plugin syncs wallpaper state via IPC
-4. If cycling is enabled, the plugin triggers `--random` at the configured interval
+2. It uses `waypaper-video-random` (bundled) to restore wallpapers with correct Wayland environment
+3. The script verifies each monitor — if mpvpaper is running but showing wrong wallpaper, it restores the correct one
+4. When DMS starts, the plugin syncs wallpaper state via IPC
+5. If cycling is enabled, the plugin triggers `--random` at the configured interval
+
+## Bundled: waypaper-video-random
+
+This plugin includes `waypaper-video-random`, a script that:
+
+- Restores the last wallpaper per monitor from persistent state
+- Falls back to random wallpaper if no restore state exists
+- **Verifies mpvpaper is showing the correct wallpaper** before skipping (fixes session resume issues)
+- Filters Wallpaper Engine projects by compatibility tags
+- Supports per-output playlists
 
 ## Troubleshooting
 
@@ -96,34 +93,23 @@ This plugin is designed to work with [`waypaper-video-random`](https://github.co
    journalctl --user -u waypaper-restore.service
    ```
 
-3. Find your NIRI socket:
-   ```bash
-   ls /run/user/$(id -u)/niri*.sock
-   ```
-
-4. Update the `NIRI_SOCKET` in the service file, then:
-   ```bash
-   systemctl --user daemon-reload
-   systemctl --user restart waypaper-restore.service
-   ```
-
-5. Test manually:
+3. Test manually:
    ```bash
    XDG_SESSION_TYPE=wayland WAYLAND_DISPLAY=wayland-1 waypaper --restore
    ```
 
 ### linux-wallpaperengine crashes immediately
 
-This usually means missing Wayland environment variables. The restore service **must** have:
+The restore service **must** have these environment variables:
 - `XDG_SESSION_TYPE=wayland`
 - `WAYLAND_DISPLAY=wayland-1`
-- `NIRI_SOCKET` pointing to your niri socket
+
+These are set in the bundled service file.
 
 ### Cycling not working
 
 1. Enable cycling in plugin settings
-2. Make sure `waypaper-video-random` supports `--random` flag
-3. Check that playlists are configured in `~/.config/waypaper/video-smart-rules.json`
+2. Make sure playlists are configured in `~/.config/waypaper/video-smart-rules.json`
 
 ### DMS doesn't show wallpaper
 
@@ -136,8 +122,9 @@ wallpaperDaemon/
 ├── plugin.json                    # Plugin manifest
 ├── WallpaperDaemon.qml           # Main daemon component
 ├── WallpaperDaemonSettings.qml   # Settings UI
+├── waypaper-video-random         # Restore/random script (bundled)
 ├── systemd/
-│   └── waypaper-restore.service # Boot-time restore service (install manually)
+│   └── waypaper-restore.service  # Boot-time restore service
 └── README.md
 ```
 
