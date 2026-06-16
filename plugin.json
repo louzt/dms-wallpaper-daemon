@@ -1,0 +1,21 @@
+{
+  "id": "wallpaperDaemon",
+  "name": "Wallpaper Daemon",
+  "description": "Restores Waypaper wallpapers at startup and syncs with DMS session. Works with any backend supported by waypaper (linux-wallpaperengine, mpvpaper, swww, etc).",
+  "version": "1.0.0",
+  "author": "lou",
+  "type": "daemon",
+  "capabilities": ["wallpaper", "bridge", "process", "settings_read", "settings_write"],
+  "component": "./WallpaperDaemon.qml",
+  "settings": "./WallpaperDaemonSettings.qml",
+  "icon": "wallpaper",
+  "permissions": [
+    "settings_read",
+    "settings_write",
+    "process"
+  ],
+  "requires_dms": ">=0.1.0",
+  "requires": [
+    "waypaper"
+  ]
+}
