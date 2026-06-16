@@ -7,10 +7,8 @@ Requisite=niri.service
 [Service]
 Type=oneshot
 # Wayland session environment - REQUIRED for linux-wallpaperengine to work
-# Find your socket with: ls /run/user/$(id -u)/niri*.sock
 Environment=XDG_SESSION_TYPE=wayland
 Environment=WAYLAND_DISPLAY=wayland-1
-Environment=NIRI_SOCKET=%h/.local/state/niri/niri.sock
 ExecStart=%h/.local/bin/waypaper-video-random --restore-or-random --restore-only
 Restart=on-failure
 RestartSec=5
