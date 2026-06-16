@@ -11,6 +11,16 @@ A DankMaterialShell plugin that restores Waypaper wallpapers at startup and sync
 - **Smart restore** — verifies mpvpaper is showing the correct wallpaper before skipping
 - **Works with any Waypaper backend** (linux-wallpaperengine, mpvpaper, swww, etc.)
 
+## Replaces waypaperd.service
+
+This plugin **replaces** the legacy `waypaperd.service` daemon. If you have it installed, disable it:
+
+```bash
+systemctl --user disable --now waypaperd.service
+```
+
+The plugin provides the same functionality (restore on boot + cycling) but integrated into DMS with a settings UI.
+
 ## Requirements
 
 - [DankMaterialShell (DMS)](https://github.com/SomeSomeone/DankMaterialShell)
