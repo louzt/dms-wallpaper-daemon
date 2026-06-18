@@ -1,17 +1,19 @@
 [Unit]
-Description=Restore Waypaper wallpapers on boot
+Description=Restore Waypaper wallpapers for niri
 PartOf=niri.service
+Wants=dms.service
 After=niri.service dms.service
 Requisite=niri.service
 
 [Service]
-Type=oneshot
-# Wayland session environment - REQUIRED for linux-wallpaperengine to work
+Type=simple
 Environment=XDG_SESSION_TYPE=wayland
 Environment=WAYLAND_DISPLAY=wayland-1
 ExecStart=%h/.config/DankMaterialShell/plugins/wallpaperDaemon/waypaper-video-random --restore-or-random --restore-only
 Restart=on-failure
 RestartSec=5
+TimeoutStopSec=10
+KillMode=process
 
 [Install]
 WantedBy=niri.service

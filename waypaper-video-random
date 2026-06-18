@@ -633,7 +633,10 @@ def apply_wallpaper(candidate: Candidate, output_name: str, dry_run: bool, verbo
     if dry_run:
         print(f"event=dry_run monitor={output_name} command='waypaper --backend linux-wallpaperengine --fill fill --monitor {output_name} --wallpaper {candidate.token}{candidate.entry_ext} --no-post-command'")
         return public_result(output_name, candidate, 0)
-    result = subprocess.run(command, check=False, capture_output=True, text=True)
+    # Use setsid to run in own session + process group so systemd KillMode=mixed
+    # does not cascade SIGTERM to children when the service exits
+    setsid_cmd = ["setsid", "--fork", "--"] + command
+    result = subprocess.run(setsid_cmd, check=False, capture_output=True, text=True)
     raw_child_output = (result.stdout or "") + (result.stderr or "")
     effective_returncode = result.returncode
     launch_failure = detect_waypaper_launch_failure(raw_child_output, output_name)
