@@ -22,6 +22,7 @@ from typing import Any
 
 
 VIDEO_EXTENSIONS = {".mp4", ".webm", ".mkv", ".avi", ".mov"}
+STATIC_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 TEXT_SCAN_EXTENSIONS = {".html", ".htm", ".js", ".mjs", ".json"}
 DEFAULT_ROOTS = [
     Path("~/.steam/root/steamapps/workshop/content/431960").expanduser(),
@@ -36,6 +37,8 @@ LAST_RUN_PATH = STATE_DIR / "waypaper-video-random-last.json"
 PRIVATE_RESTORE_PATH = STATE_DIR / "waypaper-video-random-restore.private.json"
 BENCHMARK_PATH = STATE_DIR / "waypaper-video-random-benchmark.json"
 METADATA_CACHE_PATH = STATE_DIR / "waypaper-video-metadata-cache.private.json"
+XDG_STATE_HOME = Path(os.environ.get("XDG_STATE_HOME", "~/.local/state")).expanduser()
+OVERRIDE_PATH = Path(os.environ.get("LZT_WALLPAPER_OVERRIDE_PATH", str(XDG_STATE_HOME / "lzt" / "wallpaper-override.json"))).expanduser()
 DEFAULT_SUSPICIOUS_TITLE_REGEX = [
     r"\bacam\b",
     r"\bcamrip\b",
@@ -126,6 +129,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true", help="Print sanitized commands without applying wallpapers.")
     parser.add_argument("--verbose", action="store_true", help="Print sanitized child output even when commands succeed.")
     parser.add_argument("--max-retries", type=int, default=2, help="Retry failed random selections per output unless the output has a fixed single-item playlist.")
+    parser.add_argument("--max-fixed-playlist-attempts", type=int, default=3, help="Retry a fixed single-item playlist this many times before using a static fallback.")
+    parser.add_argument("--fallback-wallpaper", type=Path, help="Static image to apply with swww when a fixed playlist item fails.")
     return parser.parse_args()
 
 
@@ -168,6 +173,160 @@ def notify(summary: str, body: str) -> None:
             subprocess.Popen(["notify-send", summary, body], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError:
         pass
+
+
+def _read_cmdline(pid: int) -> list[str]:
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return []
+    return [part.decode("utf-8", errors="replace") for part in raw.split(b"\0") if part]
+
+
+def _has_arg_value(args: list[str], flag: str, value: str) -> bool:
+    for index, item in enumerate(args):
+        if item == flag and index + 1 < len(args) and args[index + 1] == value:
+            return True
+        if item.startswith(f"{flag}=") and item.split("=", 1)[1] == value:
+            return True
+    return False
+
+
+def _renderer_backend_for_args(args: list[str], output_name: str) -> str | None:
+    if not args:
+        return None
+    executable = Path(args[0]).name
+    if executable == "linux-wallpaperengine" and _has_arg_value(args, "--screen-root", output_name):
+        return "linux-wallpaperengine"
+    if executable == "mpvpaper" and output_name in args:
+        return "mpvpaper"
+    return None
+
+
+def find_renderer(output_name: str) -> tuple[str, int] | None:
+    """Return the newest known external renderer process for one output."""
+    matches: list[tuple[int, str]] = []
+    proc_root = Path("/proc")
+    for proc_dir in proc_root.iterdir():
+        if not proc_dir.name.isdigit():
+            continue
+        pid = int(proc_dir.name)
+        args = _read_cmdline(pid)
+        backend = _renderer_backend_for_args(args, output_name)
+        if backend:
+            matches.append((pid, backend))
+    if not matches:
+        return None
+    pid, backend = max(matches, key=lambda item: item[0])
+    return backend, pid
+
+
+def _load_override_payload() -> dict[str, Any]:
+    try:
+        payload = json.loads(OVERRIDE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"version": 1, "overrides": {}}
+    if not isinstance(payload, dict):
+        return {"version": 1, "overrides": {}}
+    overrides = payload.get("overrides")
+    if not isinstance(overrides, dict):
+        payload["overrides"] = {}
+    return payload
+
+
+def _live_override_entries(overrides: dict[str, Any]) -> dict[str, Any]:
+    live: dict[str, Any] = {}
+    for monitor, entry in overrides.items():
+        if not isinstance(entry, dict):
+            continue
+        try:
+            pid = int(entry.get("pid", 0))
+        except (TypeError, ValueError):
+            continue
+        if pid > 0 and Path(f"/proc/{pid}").exists():
+            live[str(monitor)] = entry
+    return live
+
+
+def write_override_file(public_results: list[dict[str, Any]]) -> None:
+    """Write per-output renderer liveness for DMS/QML health checks.
+
+    Behaviour per monitor:
+    - returncode == 0 AND renderer alive in /proc → live entry {backend, pid, since}
+    - returncode != 0 (launch failed / detected crash) → quarantine entry
+      {backend: "quarantine", pid: 0, quarantine_reason, quarantine_since}
+      so the QML self-heal Timer can detect it and trigger fallback.
+    - previously-live entry whose /proc/<pid> is gone → entry removed
+      (plugin will read stale-data, see no override, and not relaunch;
+      this is correct: if the renderer died between writes, the next
+      successful apply_wallpaper() refreshes the entry).
+    """
+    if not public_results:
+        return
+    payload = _load_override_payload()
+    overrides = _live_override_entries(payload.get("overrides", {}))
+    now = int(time.time())
+    for row in public_results:
+        monitor = str(row.get("monitor", "")).strip()
+        if not monitor:
+            continue
+        try:
+            returncode = int(row.get("returncode", 1))
+        except (TypeError, ValueError):
+            returncode = 1
+        if returncode != 0:
+            # Quarantine: signal the plugin to attempt fallback for this monitor
+            overrides[monitor] = {
+                "backend": "quarantine",
+                "pid": 0,
+                "quarantine_since": now,
+                "quarantine_reason": str(row.get("quarantine_reason") or "launch_failed"),
+                "quarantine_code": returncode,
+                "last_project": row.get("project"),
+            }
+            print(f"event=renderer_quarantine monitor={monitor} code={returncode} reason={sanitize_text(str(row.get('quarantine_reason') or 'launch_failed'))}")
+            continue
+        renderer = find_renderer(monitor)
+        if renderer is None:
+            overrides.pop(monitor, None)
+            print(f"event=renderer_pid_missing monitor={monitor} backend=external")
+            continue
+        backend, pid = renderer
+        overrides[monitor] = {
+            "backend": backend,
+            "pid": pid,
+            "since": now,
+            "project": row.get("project"),
+            "type": row.get("type"),
+        }
+    payload = {
+        "version": 1,
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+        "overrides": overrides,
+    }
+    try:
+        OVERRIDE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = OVERRIDE_PATH.with_name(f"{OVERRIDE_PATH.name}.tmp")
+        tmp_path.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+        tmp_path.chmod(0o600)
+        tmp_path.replace(OVERRIDE_PATH)
+        print(f"event=override_write monitors={','.join(sorted(overrides)) or '(none)'} path={sanitize_text(str(OVERRIDE_PATH))}")
+    except OSError as exc:
+        print(f"event=override_write_failed error={exc.__class__.__name__}", file=sys.stderr)
+
+
+def print_state_event(row: dict[str, Any]) -> None:
+    monitor = str(row.get("monitor", "")).strip()
+    if not monitor:
+        return
+    print(
+        "event=state"
+        f" monitor={monitor}"
+        f" project={row.get('project')}"
+        f" returncode={row.get('returncode')}"
+        f" type={row.get('type')}"
+        f" entry_ext={row.get('entry_ext')}"
+    )
 
 
 def classify_waypaper_log_failure(log_text: str) -> str:
@@ -606,6 +765,58 @@ def _get_mpvpaper_wallpaper_path(output_name: str) -> str | None:
         return None
 
 
+def fallback_image_for_candidate(candidate: Candidate, configured_fallback: Path | None) -> Path | None:
+    if configured_fallback is not None:
+        fallback_path = configured_fallback.expanduser()
+        if fallback_path.exists() and fallback_path.suffix.casefold() in STATIC_IMAGE_EXTENSIONS:
+            return fallback_path
+    if candidate.wallpaper_path.exists() and candidate.wallpaper_path.suffix.casefold() in STATIC_IMAGE_EXTENSIONS:
+        return candidate.wallpaper_path
+    for name in ("preview.jpg", "preview.jpeg", "preview.png", "preview.gif", "preview.webp"):
+        preview = candidate.project_dir / name
+        if preview.exists():
+            return preview
+    return None
+
+
+def apply_static_fallback(candidate: Candidate, output_name: str, args: argparse.Namespace, verbose: bool) -> tuple[dict[str, Any], Candidate] | None:
+    fallback_path = fallback_image_for_candidate(candidate, args.fallback_wallpaper)
+    if fallback_path is None:
+        print(f"event=fallback_skip monitor={output_name} project={candidate.token} reason=no_static_image")
+        return None
+    fallback_candidate = Candidate(
+        project_dir=candidate.project_dir,
+        wallpaper_path=fallback_path,
+        title=candidate.title,
+        wallpaper_type="static",
+        width=None,
+        height=None,
+        duration=None,
+        tags=("static-fallback",),
+    )
+    print(f"event=fallback_static monitor={output_name} project={candidate.token} entry_ext={fallback_candidate.entry_ext}")
+    if args.dry_run:
+        result = public_result(output_name, fallback_candidate, 0)
+        print_state_event(result)
+        return result, fallback_candidate
+    if shutil.which("swww") is None:
+        print(f"event=fallback_failed monitor={output_name} project={candidate.token} reason=swww_missing")
+        return public_result(output_name, fallback_candidate, 127), fallback_candidate
+    command = ["swww", "img", "--outputs", output_name, "--transition-type", "none", str(fallback_path)]
+    result = subprocess.run(command, text=True, capture_output=True, check=False)
+    if result.returncode != 0 or verbose:
+        tail = sanitize_text((result.stdout or "") + (result.stderr or "")).strip()
+        if tail:
+            print(tail)
+    public = public_result(output_name, fallback_candidate, result.returncode)
+    if result.returncode == 0:
+        _update_dms_wallpaper(output_name, str(fallback_path))
+        print_state_event(public)
+    else:
+        print(f"event=fallback_failed monitor={output_name} project={candidate.token} code={result.returncode}")
+    return public, fallback_candidate
+
+
 def apply_wallpaper(candidate: Candidate, output_name: str, dry_run: bool, verbose: bool) -> dict[str, Any]:
     current_row = load_private_restore_rows().get(output_name, {})
     current_token = str(current_row.get("project") or "").strip() if isinstance(current_row, dict) else ""
@@ -615,7 +826,9 @@ def apply_wallpaper(candidate: Candidate, output_name: str, dry_run: bool, verbo
             running_path = _get_mpvpaper_wallpaper_path(output_name)
             if running_path and Path(running_path).resolve() == candidate.wallpaper_path.resolve():
                 print(f"event=skip monitor={output_name} project={candidate.token} reason=already_active")
-                return public_result(output_name, candidate, 0)
+                result = public_result(output_name, candidate, 0)
+                print_state_event(result)
+                return result
             print(f"event=resume monitor={output_name} project={candidate.token} reason=mpvpaper_wrong_wallpaper")
         else:
             print(f"event=resume monitor={output_name} project={candidate.token} reason=was_active_but_dead")
@@ -632,7 +845,9 @@ def apply_wallpaper(candidate: Candidate, output_name: str, dry_run: bool, verbo
     print(f"event=apply monitor={output_name} project={candidate.token} type={candidate.wallpaper_type} orientation={candidate.orientation} entry_ext={candidate.entry_ext}")
     if dry_run:
         print(f"event=dry_run monitor={output_name} command='waypaper --backend linux-wallpaperengine --fill fill --monitor {output_name} --wallpaper {candidate.token}{candidate.entry_ext} --no-post-command'")
-        return public_result(output_name, candidate, 0)
+        result = public_result(output_name, candidate, 0)
+        print_state_event(result)
+        return result
     # Use setsid to run in own session + process group so systemd KillMode=mixed
     # does not cascade SIGTERM to children when the service exits
     setsid_cmd = ["setsid", "--fork", "--"] + command
@@ -650,10 +865,13 @@ def apply_wallpaper(candidate: Candidate, output_name: str, dry_run: bool, verbo
         if tail:
             print(tail)
     print(f"event=done monitor={output_name} project={candidate.token} returncode={effective_returncode}")
+    quarantine_reason = "waypaper_launch_failed:" + reason if launch_failure is not None else None
+    result = public_result(output_name, candidate, effective_returncode, quarantine_reason)
     # Sync to DMS if successful
     if effective_returncode == 0 and not dry_run:
         _update_dms_wallpaper(output_name, str(candidate.wallpaper_path))
-    return public_result(output_name, candidate, effective_returncode)
+        print_state_event(result)
+    return result
 
 
 def _update_dms_wallpaper(output_name: str, wallpaper_path: str) -> None:
@@ -667,8 +885,8 @@ def _update_dms_wallpaper(output_name: str, wallpaper_path: str) -> None:
         pass  # DMS not available or timeout
 
 
-def public_result(output_name: str, candidate: Candidate, returncode: int) -> dict[str, Any]:
-    return {
+def public_result(output_name: str, candidate: Candidate, returncode: int, quarantine_reason: str | None = None) -> dict[str, Any]:
+    data: dict[str, Any] = {
         "monitor": output_name,
         "project": candidate.token,
         "returncode": returncode,
@@ -677,6 +895,9 @@ def public_result(output_name: str, candidate: Candidate, returncode: int) -> di
         "entry_ext": candidate.entry_ext,
         "tags": list(candidate.tags),
     }
+    if quarantine_reason:
+        data["quarantine_reason"] = quarantine_reason
+    return data
 
 
 def private_result(output_name: str, candidate: Candidate, returncode: int) -> dict[str, Any]:
@@ -726,6 +947,13 @@ def write_states(public_results: list[dict[str, Any]], private_results: list[dic
     PRIVATE_RESTORE_PATH.write_text(json.dumps(private_payload, indent=2, sort_keys=True), encoding="utf-8")
     LAST_RUN_PATH.chmod(0o600)
     PRIVATE_RESTORE_PATH.chmod(0o600)
+    for row in public_results:
+        try:
+            if int(row.get("returncode", 1)) == 0:
+                print_state_event(row)
+        except (TypeError, ValueError):
+            continue
+    write_override_file(public_results)
 
 
 def stop_static_wallpaper_daemons(dry_run: bool, rules: dict[str, Any]) -> None:
@@ -797,6 +1025,10 @@ def restore(outputs: list[OutputInfo], candidates: list[Candidate], rules: dict[
             candidate = selection
             print(f"event=restore_missing_monitor monitor={output.name} action=random_fill")
         result = apply_wallpaper(candidate, output.name, args.dry_run, args.verbose)
+        if int(result["returncode"]) != 0 and has_fixed_single_playlist(output, rules):
+            fallback = apply_static_fallback(candidate, output.name, args, args.verbose)
+            if fallback is not None:
+                result, candidate = fallback
         public_results.append(result)
         private_results.append(private_result(output.name, candidate, int(result["returncode"])))
         exit_code = max(exit_code, int(result["returncode"]))
@@ -855,7 +1087,16 @@ def random_cycle(outputs: list[OutputInfo], candidates: list[Candidate], rules: 
             if int(result["returncode"]) == 0:
                 break
             if fixed_single:
-                print(f"event=retry_skip monitor={output.name} project={candidate.token} reason=fixed_single_playlist")
+                max_fixed_attempts = max(0, args.max_fixed_playlist_attempts)
+                if attempts < max_fixed_attempts:
+                    attempts += 1
+                    print(f"event=retry_fixed_playlist monitor={output.name} project={candidate.token} attempt={attempts}")
+                    continue
+                fallback = apply_static_fallback(candidate, output.name, args, args.verbose)
+                if fallback is not None:
+                    result, candidate = fallback
+                else:
+                    print(f"event=retry_skip monitor={output.name} project={candidate.token} reason=fixed_single_playlist")
                 break
             if attempts >= max(0, args.max_retries):
                 print(f"event=retry_stop monitor={output.name} project={candidate.token} reason=max_retries")
