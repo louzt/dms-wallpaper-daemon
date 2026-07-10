@@ -9,6 +9,7 @@ A DankMaterialShell plugin that restores Waypaper wallpapers at startup and sync
 - **Optional wallpaper cycling** with configurable interval
 - **Fallback wallpaper** when Waypaper fails
 - **Smart restore** — verifies mpvpaper is showing the correct wallpaper before skipping
+- **Self-heal polling** — detects dead external renderers and relaunches them automatically
 - **Works with any Waypaper backend** (linux-wallpaperengine, mpvpaper, swww, etc.)
 
 ## Replaces waypaperd.service
@@ -70,6 +71,9 @@ Access settings via **DMS Settings → Plugins → Wallpaper Daemon**:
 | Enable cycling | `false` | Periodically change wallpapers |
 | Cycle interval | `30 min` | How often to cycle wallpapers |
 | Fallback wallpaper | *(empty)* | Path to image shown when Waypaper fails |
+| Enable self-heal | `true` | Poll renderer liveness and relaunch dropped monitors |
+| Health poll interval | `10000 ms` | How often to scan `/proc/<pid>` (1000–60000) |
+| Relaunch cooldown | `60 s` | Minimum seconds between relaunches per monitor (10–600) |
 
 ## How it works
 
@@ -115,6 +119,64 @@ The restore service **must** have these environment variables:
 - `WAYLAND_DISPLAY=wayland-1`
 
 These are set in the bundled service file.
+
+### linux-wallpaperengine SIGSEGV in PulseAudioPlaybackRecorder
+
+If `linux-wallpaperengine` crashes with stack frames inside
+`PulseAudioPlaybackRecorder::update` / `pa_server_info_cb` even when
+`linux_wallpaperengine_silent = True`, the audio path is still loaded.
+Disable audio processing explicitly in `~/.config/waypaper/config.ini`:
+
+```ini
+linux_wallpaperengine_silent = True
+linux_wallpaperengine_no_audio_processing = True
+linux_wallpaperengine_disable_particles = True
+```
+
+`--silent` only mutes output volume; it does not skip PulseAudio
+initialization. `--no-audio-processing` actually bypasses the recorder
+and is required to avoid the SIGSEGV.
+
+## Self-heal (v1.1.0+)
+
+The plugin polls the renderer liveness file written by
+`waypaper-video-random` (at
+`$XDG_STATE_HOME/lzt/wallpaper-override.json`, default
+`~/.local/state/lzt/wallpaper-override.json`). For each monitor whose
+recorded PID is missing (`/proc/<pid>` gone) and outside the cooldown
+window, the plugin relaunches the renderer via:
+
+```bash
+waypaper-video-random --mode smart --monitor <name> --restore-only --verbose
+```
+
+Then it syncs the recovered wallpaper to DMS via
+`dms ipc wallpaper setFor <output> <path>`.
+
+### Settings (DMS Settings → Plugins → Wallpaper Daemon)
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| Enable self-heal | `true` | Poll renderer liveness and relaunch dropped monitors |
+| Health poll interval | `10000 ms` | How often to scan `/proc/<pid>` (1000–60000) |
+| Relaunch cooldown | `60 s` | Minimum seconds between relaunches per monitor (10–600) |
+
+### Override file format
+
+```json
+{
+  "version": 1,
+  "updated_at": "2026-07-10T15:42:01",
+  "overrides": {
+    "HDMI-A-1": {"backend": "linux-wallpaperengine", "pid": 12345, "since": 1752149521}
+  }
+}
+```
+
+The script writes this file atomically (`tmp` + `replace`) every time a
+monitor receives a successful `apply_wallpaper()` result. The plugin
+reads it on each poll cycle and uses `/proc/<pid>` directory existence
+as the liveness signal.
 
 ### Cycling not working
 

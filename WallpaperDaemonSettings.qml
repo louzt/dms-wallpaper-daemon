@@ -51,6 +51,40 @@ PluginSettings {
         unit: I18n.tr("min")
     }
 
+    StyledText {
+        text: I18n.tr("Self-heal")
+        font.pixelSize: Theme.fontSizeMedium
+        font.weight: Font.Bold
+        color: Theme.surfaceText
+    }
+
+    ToggleSetting {
+        settingKey: "enableSelfHeal"
+        label: I18n.tr("Enable self-heal")
+        description: I18n.tr("Poll the renderer liveness override file and relaunch dropped external wallpaper renderers (e.g. linux-wallpaperengine after PulseAudio crash)")
+        defaultValue: true
+    }
+
+    SliderSetting {
+        settingKey: "healthPollMs"
+        label: I18n.tr("Health poll interval")
+        description: I18n.tr("How often to check renderer PIDs (1000-60000 ms)")
+        minimum: 1000
+        maximum: 60000
+        defaultValue: 10000
+        unit: I18n.tr("ms")
+    }
+
+    SliderSetting {
+        settingKey: "relaunchCooldownSeconds"
+        label: I18n.tr("Relaunch cooldown")
+        description: I18n.tr("Minimum seconds between relaunch attempts per monitor")
+        minimum: 10
+        maximum: 600
+        defaultValue: 60
+        unit: I18n.tr("s")
+    }
+
     StringSetting {
         settingKey: "fallbackWallpaper"
         label: I18n.tr("Fallback wallpaper path")
